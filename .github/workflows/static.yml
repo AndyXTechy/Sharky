@@ -1,0 +1,475 @@
+<!DOCTYPE html>
+<html lang="da">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Lær Russisk med AI</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+    <!-- Firebase SDKs -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, getDoc, setDoc, updateDoc, collection, addDoc, query, getDocs, serverTimestamp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Firebase instances declared here, will be assigned in initializeFirebase
+        let fbApp;
+        let fbDb;
+        let fbAuth;
+        let currentUserId = null; // Will store the authenticated user ID
+        let userProfile = {}; // Stores user data from Firestore
+
+        // Initialize Firebase and handle authentication
+        async function initializeFirebase() {
+            const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+            const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+
+            if (Object.keys(firebaseConfig).length === 0) {
+                console.error("Firebase config is missing. Cannot initialize Firebase.");
+                // Using a simple message here, as addMessage might not be available yet
+                document.getElementById('chat-area').innerHTML += '<div class="message ai-message"><span class="shark-icon">🦈</span><div class="ai-message-content">Beklager, der er et problem med appens opsætning (Firebase-konfiguration mangler). Kontakt venligst support.</div></div>';
+                return;
+            }
+
+            fbApp = initializeApp(firebaseConfig);
+            fbDb = getFirestore(fbApp);
+            fbAuth = getAuth(fbApp);
+
+            onAuthStateChanged(fbAuth, async (user) => {
+                if (user) {
+                    currentUserId = user.uid;
+                    console.log("User authenticated:", currentUserId);
+                    await loadUserProfile(); // Load user profile and data after authentication
+                } else {
+                    console.log("No user authenticated. Signing in anonymously...");
+                    try {
+                        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                            await signInWithCustomToken(fbAuth, __initial_auth_token);
+                        } else {
+                            await signInAnonymously(fbAuth);
+                        }
+                    } catch (error) {
+                        console.error("Firebase authentication failed:", error);
+                        // Using a simple message here
+                        document.getElementById('chat-area').innerHTML += '<div class="message ai-message"><span class="shark-icon">🦈</span><div class="ai-message-content">Beklager, login mislykkedes. Prøv venligst igen senere.</div></div>';
+                    }
+                }
+            });
+        }
+
+        // --- Firestore Operations ---
+        async function getUserProfileRef() {
+            if (!currentUserId) {
+                console.error("User not authenticated. Cannot get profile reference.");
+                return null;
+            }
+            const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+            return doc(fbDb, `artifacts/${appId}/users/${currentUserId}/profile/data`);
+        }
+
+        async function getUserConversationsCollectionRef() {
+            if (!currentUserId) {
+                console.error("User not authenticated. Cannot get conversations collection reference.");
+                return null;
+            }
+            const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+            return collection(fbDb, `artifacts/${appId}/users/${currentUserId}/conversations`);
+        }
+
+        async function loadUserProfile() {
+            if (!currentUserId) return;
+
+            const profileRef = await getUserProfileRef();
+            if (!profileRef) return;
+
+            try {
+                const docSnap = await getDoc(profileRef);
+                if (docSnap.exists()) {
+                    userProfile = docSnap.data();
+                    console.log("User profile loaded:", userProfile);
+                } else {
+                    console.log("No user profile found, creating a new one.");
+                    userProfile = {
+                        averageOverallRating: 0,
+                        streakCount: 0,
+                        lastStreakDate: null,
+                        totalConversations: 0,
+                        totalDurationSeconds: 0,
+                        topicRatings: {} // { 'Mad': { totalRating: 0, count: 0 }, ... }
+                    };
+                    await setDoc(profileRef, userProfile);
+                }
+            } catch (error) {
+                console.error("Error loading user profile:", error);
+                // Using a simple message here
+                document.getElementById('chat-area').innerHTML += '<div class="message ai-message"><span class="shark-icon">🦈</span><div class="ai-message-content">Beklager, kunne ikke indlæse din profil. Prøv igen.</div></div>';
+            }
+        }
+
+        async function saveUserProfile() {
+            if (!currentUserId || !userProfile) return;
+            const profileRef = await getUserProfileRef();
+            if (!profileRef) return;
+
+            try {
+                await setDoc(profileRef, userProfile, { merge: true });
+                console.log("User profile saved.");
+            } catch (error) {
+                console.error("Error saving user profile:", error);
+                // Using a simple message here
+                document.getElementById('chat-area').innerHTML += '<div class="message ai-message"><span class="shark-icon">🦈</span><div class="ai-message-content">Beklager, kunne ikke gemme din profil. Prøv igen.</div></div>';
+            }
+        }
+
+        async function saveConversation(conversationData) {
+            if (!currentUserId) return;
+            const conversationsRef = await getUserConversationsCollectionRef();
+            if (!conversationsRef) return;
+
+            try {
+                await addDoc(conversationsRef, {
+                    ...conversationData,
+                    timestamp: serverTimestamp() // Use server timestamp
+                });
+                console.log("Conversation saved.");
+            } catch (error) {
+                console.error("Error saving conversation:", error);
+                // Using a simple message here
+                document.getElementById('chat-area').innerHTML += '<div class="message ai-message"><span class="shark-icon">🦈</span><div class="ai-message-content">Beklager, kunne ikke gemme samtalen. Prøv igen.</div></div>';
+            }
+        }
+
+        async function loadConversationHistory() {
+            if (!currentUserId) return [];
+            const conversationsRef = await getUserConversationsCollectionRef();
+            if (!conversationsRef) return [];
+
+            try {
+                // Fetch all documents and sort in memory as orderBy is restricted
+                const q = query(conversationsRef);
+                const querySnapshot = await getDocs(q);
+                const history = [];
+                querySnapshot.forEach((doc) => {
+                    history.push({ id: doc.id, ...doc.data() });
+                });
+
+                // Sort by timestamp in descending order (most recent first)
+                history.sort((a, b) => {
+                    const tsA = a.timestamp ? a.timestamp.toDate().getTime() : 0;
+                    const tsB = b.timestamp ? b.timestamp.toDate().getTime() : 0;
+                    return tsB - tsA;
+                });
+                return history;
+            } catch (error) {
+                console.error("Error loading conversation history:", error);
+                // Using a simple message here
+                document.getElementById('chat-area').innerHTML += '<div class="message ai-message"><span class="shark-icon">🦈</span><div class="ai-message-content">Beklager, kunne ikke indlæse samtalehistorik.</div></div>';
+                return [];
+            }
+        }
+
+        // Make Firebase functions globally accessible
+        window.initializeFirebase = initializeFirebase;
+        window.loadUserProfile = loadUserProfile;
+        window.saveUserProfile = saveUserProfile;
+        window.saveConversation = saveConversation;
+        window.loadConversationHistory = loadConversationHistory;
+        // window.db and window.auth are now correctly exposed after fbDb and fbAuth are assigned
+    </script>
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #0d47a1; /* Deep ocean blue */
+            background-image: 
+                radial-gradient(circle at 10% 20%, rgba(20,130,200,0.2) 0%, rgba(0,0,0,0) 60%),
+                radial-gradient(circle at 90% 80%, rgba(20,130,200,0.2) 0%, rgba(0,0,0,0) 60%),
+                linear-gradient(180deg, #1e88e5 0%, #0d47a1 100%); /* Blue gradient for depth */
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            margin: 0;
+            padding: 10px; /* Reduced padding for smaller screens */
+            box-sizing: border-box;
+            /* Removed overflow: hidden; to allow scrolling */
+        }
+        .container {
+            background-color: rgba(255, 255, 255, 0.95); /* Slightly transparent white for a clean look */
+            border-radius: 2rem; /* Even more rounded corners */
+            box-shadow: 0 15px 35px rgba(0, 0, 0, 0.25); /* Stronger shadow */
+            width: 100%;
+            max-width: 850px; /* Slightly wider for desktop */
+            display: flex;
+            flex-direction: column;
+            /* Removed overflow: hidden; to allow scrolling */
+            min-height: 700px; /* Taller */
+            border: 2px solid #64b5f6; /* Blue border to match theme */
+        }
+        .header {
+            background: linear-gradient(135deg, #42a5f5 0%, #2196f3 100%); /* Brighter blue gradient header */
+            color: white;
+            padding: 1.5rem;
+            text-align: center;
+            font-size: 1.75rem;
+            font-weight: 700;
+            border-top-left-radius: 2rem;
+            border-top-right-radius: 2rem;
+            box-shadow: 0 5px 15px rgba(0, 0, 0, 0.15);
+            position: relative;
+            display: flex;
+            justify-content: center; /* Center title, no profile button here */
+            align-items: center;
+            padding-left: 1rem; /* Adjusted padding for mobile */
+            padding-right: 1rem; /* Adjusted padding for mobile */
+        }
+        .header-title {
+            flex-grow: 1;
+            text-align: center;
+        }
+        .timer-display {
+            background-color: rgba(255, 255, 255, 0.3); /* More transparent */
+            padding: 0.5rem 1rem;
+            border-radius: 1rem;
+            font-size: 1rem;
+            font-weight: 600;
+            border: 1px solid rgba(255, 255, 255, 0.4); /* Subtle border */
+        }
+        .chat-area {
+            flex-grow: 1;
+            padding: 1rem; /* Reduced padding for mobile */
+            overflow-y: auto; /* This is correct for scrolling chat */
+            display: flex;
+            flex-direction: column;
+            gap: 1rem;
+            background-color: #e3f2fd; /* Very light blue for chat area, like clear water */
+            border-bottom: 1px solid #90caf9; /* Lighter blue border */
+        }
+        .message {
+            max-width: 90%; /* Increased max-width for messages on mobile */
+            padding: 0.85rem 1.2rem;
+            border-radius: 1.25rem; /* More rounded bubbles */
+            word-wrap: break-word;
+            animation: fadeIn 0.3s ease-out; /* Fade in animation */
+        }
+        .ai-message {
+            background-color: #81d4fa; /* Brighter light blue for AI, like shallow water */
+            align-self: flex-start;
+            border-bottom-left-radius: 0.5rem;
+            box-shadow: 0 2px 5px rgba(0, 0, 0, 0.08);
+            display: flex; /* For shark mascot */
+            align-items: flex-start;
+            gap: 0.75rem;
+            border: 1px solid #4fc3f7; /* Subtle border */
+        }
+        .ai-message .shark-icon {
+            font-size: 2rem; /* Size of the shark emoji */
+            line-height: 1; /* Align with text */
+            flex-shrink: 0; /* Prevent shrinking */
+        }
+        .ai-message-content {
+            flex-grow: 1;
+        }
+        .user-message {
+            background-color: #a5d6a7; /* Light green for user, like seaweed/coral */
+            align-self: flex-end;
+            border-bottom-right-radius: 0.5rem;
+            box-shadow: 0 2px 5px rgba(0, 0, 0, 0.08);
+            border: 1px solid #66bb6a; /* Subtle border */
+        }
+        .rating {
+            font-weight: bold;
+            margin-top: 0.5rem;
+            color: #2e7d32; /* Darker green for rating */
+        }
+        .feedback {
+            font-size: 0.85rem;
+            color: #4b5563;
+            margin-top: 0.25rem;
+        }
+        .correct-answer {
+            font-size: 0.85rem;
+            color: #4b5563;
+            margin-top: 0.25rem;
+            font-style: italic;
+        }
+        .helper-sentences {
+            background-color: #f0f4f8; /* Slightly darker for helpers */
+            padding: 1rem; /* Reduced padding for mobile */
+            border-top: 1px solid #e2e8f0;
+        }
+        .helper-sentences h3 {
+            font-weight: 700;
+            margin-bottom: 0.75rem;
+            color: #1f2937;
+            font-size: 1.1rem;
+        }
+        .helper-sentence-item {
+            margin-bottom: 0.6rem;
+            padding: 0.6rem;
+            background-color: #bbdefb; /* Medium blue for helper items */
+            border-radius: 0.75rem;
+            font-size: 0.95rem;
+            line-height: 1.4;
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
+            display: flex; /* For speaker icon */
+            align-items: center;
+            gap: 0.5rem;
+            border: 1px solid #90caf9; /* Subtle border */
+        }
+        .helper-sentence-item .russian-text-wrapper {
+            flex-grow: 1;
+        }
+        .input-area {
+            padding: 1rem; /* Reduced padding for mobile */
+            display: flex;
+            flex-wrap: wrap; /* Allow wrapping on smaller screens */
+            gap: 0.75rem; /* Reduced gap for mobile */
+            border-top: 1px solid #e2e8f0;
+            background-color: #ffffff;
+            justify-content: center;
+            align-items: center;
+        }
+        .input-area button {
+            background: linear-gradient(45deg, #2196f3 0%, #1976d2 100%); /* Blue gradient button */
+            color: white;
+            padding: 0.8rem 1.5rem; /* Adjusted padding for mobile */
+            border-radius: 0.75rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background-color 0.2s, transform 0.1s, box-shadow 0.2s;
+            box-shadow: 0 6px 12px rgba(0, 0, 0, 0.2); /* Stronger shadow */
+            display: flex;
+            align-items: center;
+            gap: 0.5rem; /* Adjusted gap for mobile */
+            border: none;
+            outline: none;
+            position: relative;
+            overflow: hidden;
+        }
+        .input-area button:hover {
+            background: linear-gradient(45deg, #1976d2 0%, #1565c0 100%);
+            transform: translateY(-2px);
+            box-shadow: 0 8px 16px rgba(0, 0, 0, 0.25);
+        }
+        .input-area button:active {
+            transform: translateY(0);
+            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.15);
+        }
+        .input-area button:disabled {
+            background: linear-gradient(45deg, #90caf9 0%, #64b5f6 100%);
+            cursor: not-allowed;
+            box-shadow: none;
+        }
+        .input-area button::before { /* Hover effect */
+            content: '';
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            width: 300%;
+            height: 300%;
+            background: rgba(255, 255, 255, 0.15);
+            border-radius: 50%;
+            transition: all 0.75s ease-out;
+            transform: translate(-50%, -50%) scale(0);
+            opacity: 0;
+        }
+        .input-area button:hover::before {
+            transform: translate(-50%, -50%) scale(1);
+            opacity: 1;
+        }
+
+        .loading-indicator {
+            text-align: center;
+            padding: 1rem;
+            color: #64748b;
+            font-style: italic;
+        }
+        .recording-indicator {
+            background: linear-gradient(45deg, #ef4444 0%, #dc2626 100%); /* Red gradient for recording */
+            animation: pulse 1.5s infinite;
+        }
+        @keyframes pulse {
+            0% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.7); }
+            70% { box-shadow: 0 0 0 10px rgba(239, 68, 68, 0); }
+            100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); }
+        }
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        /* Styles for clickable words and tooltip */
+        .russian-word {
+            cursor: pointer;
+            border-bottom: 1px dotted #1d4ed8;
+            position: relative;
+            display: inline-block;
+        }
+        .russian-word:hover {
+            background-color: #bfdbfe;
+        }
+        .tooltip {
+            position: absolute;
+            background-color: #333;
+            color: #fff;
+            padding: 0.5rem 0.75rem;
+            border-radius: 0.5rem;
+            white-space: nowrap;
+            z-index: 100;
+            bottom: 125%;
+            left: 50%;
+            transform: translateX(-50%);
+            opacity: 0;
+            visibility: hidden;
+            transition: opacity 0.2s, visibility 0.2s;
+            pointer-events: none; /* Allows clicks to pass through to underlying elements */
+        }
+        .russian-word:hover .tooltip {
+            opacity: 1;
+            visibility: visible;
+        }
+        .tooltip::after {
+            content: "";
+            position: absolute;
+            top: 100%;
+            left: 50%;
+            margin-left: -5px;
+            border-width: 5px;
+            border-style: solid;
+            border-color: #333 transparent transparent transparent;
+        }
+
+        /* Speaker icon for helper sentences */
+        .speaker-icon-button {
+            background: none;
+            border: none;
+            padding: 0;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #1976d2; /* Darker blue for speaker icon */
+            transition: color 0.2s;
+            flex-shrink: 0;
+        }
+        .speaker-icon-button:hover {
+            color: #0d47a1; /* Even darker blue on hover */
+        }
+        .speaker-icon-button svg {
+            width: 1.25rem;
+            height: 1.25rem;
+        }
+
+        /* Modal for conversation summary */
+        .modal-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0, 0, 0, 0.6);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            z-index: 1000;
+            opac
